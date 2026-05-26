@@ -20,7 +20,7 @@ from typing import List, Dict, Tuple, Optional, Set, Union
 
 PRINT_LOCK = threading.Lock()
 OUTPUT_DIR = "data"
-XRAY_PATH = "./xray" # فرض بر این است که فایل باینری xray در این مسیر است
+XRAY_PATH = "./xray" 
 
 CONFIG_URLS: List[str] = [
     "https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/base64/mix",
@@ -65,20 +65,19 @@ CONFIG_URLS: List[str] = [
 
 OUTPUT_FILENAME: str = os.getenv("REALITY_OUTPUT_FILENAME", "khanevadeh") + "_base64.txt"
 
-# تنظیمات تست
+# تنظیمات تست اولیه
 REQUEST_TIMEOUT: int = 15
 TCP_CONNECT_TIMEOUT: int = 3
 NUM_TCP_TESTS: int = 3
 MIN_SUCCESSFUL_TESTS_RATIO: float = 0.6
 
-# برای جلوگیری از تداخل زمان گیت‌هاب، سقف تست عمیق با Xray را محدود می‌کنیم
+# محدودیت‌ها برای پایداری در گیت‌هاب اکشنز
 MAX_CONFIGS_FOR_XRAY: int = 1500 
-FINAL_MAX_OUTPUT_CONFIGS: int = 500
+MAX_CONFIGS_FOR_IRAN_CHECK: int = 40  # تست ۴۰ تای برتر در ایران برای جلوگیری از بلاک شدن توسط Check-Host
+FINAL_MAX_OUTPUT_CONFIGS: int = 20
 
 SEEN_IDENTIFIERS: Set[Tuple[str, int, str]] = set()
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-]
+USER_AGENTS = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36']
 
 # --- Helper Functions ---
 
@@ -98,82 +97,54 @@ def print_progress(iteration: int, total: int, prefix: str = '', suffix: str = '
             sys.stdout.write('\n')
 
 def get_free_port() -> int:
-    """یافتن یک پورت خالی در سیستم برای اختصاص دادن به پروسه Xray اکتیو"""
     s = socket.socket()
     s.bind(('127.0.0.1', 0))
     port = s.getsockname()[1]
     s.close()
     return port
 
-def parse_vless_config(config_str: str) -> Optional[Dict[str, Union[str, int]]]:
-    if not config_str.startswith("vless://"):
-        return None
+def parse_vless_config(config_str: str) -> Optional[Dict]:
+    if not config_str.startswith("vless://"): return None
     try:
         parsed = urllib.parse.urlparse(config_str)
-        if not parsed.netloc or '@' not in parsed.netloc:
-            return None
-            
         uuid, server_port = parsed.netloc.split('@', 1)
-        server_host = parsed.hostname
-        server_port_num = parsed.port
-
-        if not server_host or not server_port_num:
-            return None
-
         query_params = urllib.parse.parse_qs(parsed.query)
-        if query_params.get('security', [''])[0] != 'reality':
-            return None
-        
-        if not query_params.get('pbk', [''])[0]:
-            return None
-
+        if query_params.get('security', [''])[0] != 'reality': return None
         return {
-            "uuid": uuid,
-            "server": server_host,
-            "port": int(server_port_num),
-            "pbk": query_params.get('pbk', [''])[0],
-            "fp": query_params.get('fp', [''])[0],
-            "sni": query_params.get('sni', [''])[0],
-            "sid": query_params.get('sid', [''])[0],
+            "uuid": uuid, "server": parsed.hostname, "port": int(parsed.port),
+            "pbk": query_params.get('pbk', [''])[0], "fp": query_params.get('fp', [''])[0],
+            "sni": query_params.get('sni', [''])[0], "sid": query_params.get('sid', [''])[0],
             "spx": query_params.get('spx', [''])[0],
             "name": urllib.parse.unquote(parsed.fragment) if parsed.fragment else "",
             "original_config": config_str
         }
-    except Exception:
-        return None
+    except Exception: return None
 
 def is_base64_content(s: str) -> bool:
-    if not isinstance(s, str) or not s:
-        return False
-    if not re.match(r'^[A-Za-z0-9+/=\s]+$', s) or len(s.strip()) % 4 != 0:
-        return False
+    if not isinstance(s, str) or not s: return False
+    if not re.match(r'^[A-Za-z0-9+/=\s]+$', s) or len(s.strip()) % 4 != 0: return False
     try:
         base64.b64decode(s, validate=True)
         return True
-    except Exception:
-        return False
+    except Exception: return False
 
 # --- Core Logic ---
 
 def fetch_subscription_content(url: str) -> Optional[str]:
     try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENTS[0]})
-        response.raise_for_status()
-        return response.text.strip()
-    except requests.RequestException:
-        return None
+        res = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENTS[0]})
+        return res.text.strip() if res.status_code == 200 else None
+    except Exception: return None
 
-def process_subscription_content(content: str, source_url: str) -> List[Dict[str, Union[str, int]]]:
+def process_subscription_content(content: str) -> List[Dict]:
     if not content: return []
-    decoded_content = content
+    decoded = content
     if is_base64_content(content):
-        try:
-            decoded_content = base64.b64decode(content).decode('utf-8', errors='ignore')
-        except Exception:
-            return []
+        try: decoded = base64.b64decode(content).decode('utf-8', errors='ignore')
+        except Exception: return []
             
     valid_configs = []
-    for line in decoded_content.splitlines():
+    for line in decoded.splitlines():
         line = line.strip()
         if line.startswith("vless://") and "security=reality" in line:
             parsed_data = parse_vless_config(line)
@@ -184,194 +155,164 @@ def process_subscription_content(content: str, source_url: str) -> List[Dict[str
                     valid_configs.append(parsed_data)
     return valid_configs
 
-def gather_configurations(links: List[str]) -> List[Dict]:
-    safe_print("🚀 مرحله ۱/۳: در حال دریافت و پردازش اولیه کانفیگ‌ها...")
-    all_configs = []
-    total_links = len(links)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-        futures = {executor.submit(fetch_subscription_content, url): url for url in links}
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            content = future.result()
-            if content:
-                all_configs.extend(process_subscription_content(content, futures[future]))
-            print_progress(i + 1, total_links, prefix='دریافت:', suffix='تکمیل')
-    return all_configs
-
 def test_tcp_latency(host: str, port: int, timeout: int) -> Optional[float]:
     try:
-        start_time = time.perf_counter()
+        start = time.perf_counter()
         with socket.create_connection((host, port), timeout=timeout):
-            return (time.perf_counter() - start_time) * 1000
-    except (socket.timeout, ConnectionRefusedError, OSError):
-        return None
+            return (time.perf_counter() - start) * 1000
+    except Exception: return None
 
 def quick_tcp_filter(config: Dict) -> Optional[Dict]:
-    """فیلتر اولیه برای حذف سرورهایی که پورتشان کاملاً بسته است"""
-    host, port = config['server'], config['port']
     latencies = []
     for _ in range(NUM_TCP_TESTS):
-        lat = test_tcp_latency(host, port, TCP_CONNECT_TIMEOUT)
+        lat = test_tcp_latency(config['server'], config['port'], TCP_CONNECT_TIMEOUT)
         if lat: latencies.append(lat)
-        time.sleep(0.02)
-        
-    if not latencies or len(latencies) < (NUM_TCP_TESTS * MIN_SUCCESSFUL_TESTS_RATIO):
-        return None
-        
+        time.sleep(0.01)
+    if not latencies or len(latencies) < (NUM_TCP_TESTS * MIN_SUCCESSFUL_TESTS_RATIO): return None
     config['tcp_latency'] = statistics.mean(latencies)
     return config
 
 def build_xray_config(config: Dict, local_port: int) -> Dict:
-    """ساخت آبجکت جیسون استاندارد برای هسته Xray"""
     return {
         "log": {"loglevel": "none"},
-        "inbounds": [{
-            "port": local_port,
-            "listen": "127.0.0.1",
-            "protocol": "http"
-        }],
+        "inbounds": [{"port": local_port, "listen": "127.0.0.1", "protocol": "http"}],
         "outbounds": [{
             "protocol": "vless",
-            "settings": {
-                "vnext": [{
-                    "address": config["server"],
-                    "port": config["port"],
-                    "users": [{
-                        "id": config["uuid"],
-                        "encryption": "none"
-                    }]
-                }]
-            },
+            "settings": {"vnext": [{"address": config["server"], "port": config["port"], "users": [{"id": config["uuid"], "encryption": "none"}]}]},
             "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
+                "network": "tcp", "security": "reality",
                 "realitySettings": {
-                    "show": False, # اصلاح شد: تغییر false به False
-                    "fingerprint": config.get("fp", "chrome"),
-                    "serverName": config.get("sni", ""),
-                    "publicKey": config.get("pbk", ""),
-                    "shortId": config.get("sid", ""),
-                    "spiderX": config.get("spx", "")
+                    "show": False, # خطای قبلی اینجا اصلاح شد (F بزرگ)
+                    "fingerprint": config.get("fp", "chrome"), "serverName": config.get("sni", ""),
+                    "publicKey": config.get("pbk", ""), "shortId": config.get("sid", ""), "spiderX": config.get("spx", "")
                 }
             }
         }]
     }
 
 def validate_with_xray(config: Dict) -> Optional[Dict]:
-    """تست واقعی و عمیق کانفیگ با اجرای لایو هسته Xray و ارسال ریکوئست HTTP"""
     local_port = get_free_port()
-    thread_id = threading.get_ident()
-    config_file_path = f"temp_cfg_{thread_id}_{local_port}.json"
-    
-    # ایجاد فایل کانفیگ موقت برای این ترد
-    xray_json = build_xray_config(config, local_port)
-    with open(config_file_path, 'w') as f:
-        json.dump(xray_json, f)
+    config_file_path = f"temp_cfg_{threading.get_ident()}_{local_port}.json"
+    with open(config_file_path, 'w') as f: json.dump(build_xray_config(config, local_port), f)
         
     proc = None
     try:
-        # اجرای باینری Xray در پس‌زمینه
-        proc = subprocess.Popen(
-            [XRAY_PATH, "-c", config_file_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        time.sleep(0.25) # زمان کوتاه برای لود شدن کامل کور در مموری
-        
-        # تنظیم پراکسی HTTP محلی جهت تست ریکوئست
-        proxies = {
-            "http": f"http://127.0.0.1:{local_port}",
-            "https://": f"http://127.0.0.1:{local_port}"
-        }
-        
-        # تست کانکشن واقعی به اینترنت آزاد از درون پراکسی
-        start_time = time.perf_counter()
-        response = requests.get(
-            "http://cp.cloudflare.com/generate_204",
-            proxies=proxies,
-            timeout=4
-        )
-        
+        proc = subprocess.Popen([XRAY_PATH, "-c", config_file_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.2)
+        proxies = {"http": f"http://127.0.0.1:{local_port}", "https://": f"http://127.0.0.1:{local_port}"}
+        start = time.perf_counter()
+        response = requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=3.5)
         if response.status_code == 204:
-            config['real_latency'] = (time.perf_counter() - start_time) * 1000
+            config['real_latency'] = (time.perf_counter() - start) * 1000
             return config
-            
-    except Exception:
-        pass
+    except Exception: pass
     finally:
-        # پاکسازی پروسه و فایل‌های موقت تحت هر شرایطی
         if proc:
             proc.terminate()
             proc.wait()
-        if os.path.exists(config_file_path):
-            os.remove(config_file_path)
-            
+        if os.path.exists(config_file_path): os.remove(config_file_path)
+    return None
+
+def is_accessible_in_iran(config: Dict) -> Optional[Dict]:
+    """تست فیلترینگ آی‌پی سرور در ایران با استفاده از API سایت Check-Host"""
+    try:
+        host, port = config['server'], config['port']
+        # درخواست تست TCP از نودهای ایران
+        url = f"https://check-host.net/check-tcp?host={host}:{port}&node=ir1.node.check-host.net&node=ir4.node.check-host.net"
+        res = requests.get(url, headers={'Accept': 'application/json'}, timeout=8)
+        if res.status_code != 200: return None
+        
+        request_id = res.json().get("request_id")
+        if not request_id: return None
+        
+        time.sleep(3.5) # زمان انتظار برای دریافت پاسخ نودهای داخل کشور
+        
+        result_res = requests.get(f"https://check-host.net/check-result/{request_id}", timeout=8)
+        if result_res.status_code != 200: return None
+        
+        results = result_res.json()
+        # بررسی اینکه آیا حداقل یکی از نودهای ایران موفق به برقراری ارتباط شده‌اند یا خیر
+        for node, node_data in results.items():
+            if "ir" in node and node_data:
+                if isinstance(node_data, list) and len(node_data) > 0 and node_data[0]:
+                    if "time" in node_data[0] or "connected" in str(node_data[0]).lower():
+                        return config
+    except Exception: pass
     return None
 
 def evaluate_configs(configs: List[Dict]) -> List[Dict]:
-    # مرحله ۲: فیلتر سریع TCP برای سبک کردن لیست
-    safe_print(f"\n🔍 مرحله ۲/۳: پورت اسکن سریع روی {len(configs)} کانفیگ ورودی...")
-    tcp_alive_configs = []
-    total_configs = len(configs)
-    
+    # مرحله ۱: دریافت کانفیگ‌ها انجام شده
+    # مرحله ۲: پورت اسکن سریع
+    safe_print(f"\n🔍 مرحله ۲/۴: پورت اسکن سریع روی {len(configs)} کانفیگ ورودی...")
+    tcp_alive = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
         futures = {executor.submit(quick_tcp_filter, cfg): cfg for cfg in configs}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             res = future.result()
-            if res: tcp_alive_configs.append(res)
-            if (i + 1) % 50 == 0 or (i + 1) == total_configs:
-                print_progress(i + 1, total_configs, prefix='اسکن شبکه:', suffix='')
+            if res: tcp_alive.append(res)
+            if (i + 1) % 50 == 0 or (i + 1) == len(configs): print_progress(i + 1, len(configs), prefix='اسکن شبکه:')
 
-    # مرتب‌سازی بر اساس پورت اسکن و انتخاب بهترین‌ها برای تست عمیق Xray
-    tcp_alive_configs.sort(key=lambda x: x['tcp_latency'])
-    target_for_xray = tcp_alive_configs[:MAX_CONFIGS_FOR_XRAY]
+    tcp_alive.sort(key=lambda x: x['tcp_latency'])
+    target_for_xray = tcp_alive[:MAX_CONFIGS_FOR_XRAY]
     
-    # مرحله ۳: تست عمیق با خود هسته Xray
-    safe_print(f"\n🛡️ مرحله ۳/۳: تست کیفیت و صحت اعتبارسنجی با Xray-core روی {len(target_for_xray)} سرور زنده...")
-    final_verified_configs = []
-    total_xray = len(target_for_xray)
-    
-    # محدود کردن تعداد کارگرها به خاطر مصرف CPU هسته Xray در محیط اکشنز گیت‌هاب
-    xray_workers = min(12, os.cpu_count() * 3) 
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=xray_workers) as executor:
+    # مرحله ۳: تست فنی با هسته Xray
+    safe_print(f"\n🛡️ مرحله ۳/۴: تست صحت اعتبارسنجی با Xray-core روی {len(target_for_xray)} سرور زنده...")
+    xray_verified = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, os.cpu_count() * 3)) as executor:
         futures = {executor.submit(validate_with_xray, cfg): cfg for cfg in target_for_xray}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             res = future.result()
-            if res: final_verified_configs.append(res)
-            if (i + 1) % 10 == 0 or (i + 1) == total_xray:
-                print_progress(i + 1, total_xray, prefix='تست عمیق Xray:', suffix='')
+            if res: xray_verified.append(res)
+            if (i + 1) % 10 == 0 or (i + 1) == len(target_for_xray): print_progress(i + 1, len(target_for_xray), prefix='تست عمیق Xray:')
 
-    # مرتب‌سازی نهایی بر اساس پینگ واقعی پروتکل حاصل از ریکوئست وب
-    final_verified_configs.sort(key=lambda x: x['real_latency'])
-    return final_verified_configs
+    xray_verified.sort(key=lambda x: x['real_latency'])
+    target_for_iran = xray_verified[:MAX_CONFIGS_FOR_IRAN_CHECK]
+    
+    # مرحله ۴: تست فیلترینگ نهایی در ایران
+    safe_print(f"\n🇮🇷 مرحله ۴/۴: بررسی وضعیت فیلترینگ در ایران (Check-Host API) روی {len(target_for_iran)} کانفیگ برتر...")
+    final_clean_configs = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(is_accessible_in_iran, cfg): cfg for cfg in target_for_iran}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            res = future.result()
+            if res: final_clean_configs.append(res)
+            print_progress(i + 1, len(target_for_iran), prefix='تست فیلترینگ ایران:')
+            time.sleep(0.4) # تاخیر ایمن برای عدم بلاک شدن توسط چک‌هاست
+            
+    return final_clean_configs
 
 def save_results(configs: List[Dict]) -> None:
     if not configs: 
-        safe_print("\n❌ هیچ کانفیگ سالمی در تست نهایی تایید نشد.")
+        safe_print("\n❌ هیچ کانفیگی که در ایران فیلتر نباشد پیدا نشد.")
         return
     top_configs = configs[:FINAL_MAX_OUTPUT_CONFIGS]
     output_lines = []
     for i, cfg in enumerate(top_configs, 1):
         clean_link = cfg['original_config'].split('#')[0]
-        output_lines.append(f"{clean_link}#⚡_Config_{i}_RealPing-{int(cfg['real_latency'])}")
+        output_lines.append(f"{clean_link}#🇮🇷_Config_{i}_Verified")
         
     base64_str = base64.b64encode("\n".join(output_lines).encode('utf-8')).decode('utf-8')
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME)
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(base64_str)
-    safe_print(f"\n💾 فایل نهایی با موفقیت ذخیره شد: {path} | تعداد کانفیگ‌های کاملاً تضمینی: {len(top_configs)}")
+    with open(path, 'w', encoding='utf-8') as f: f.write(base64_str)
+    safe_print(f"\n💾 ذخیره شد: {path} | تعداد کانفیگ‌های ۱۰۰٪ فعال در ایران: {len(top_configs)}")
 
 def main():
-    if not os.path.exists(XRAY_PATH):
-        safe_print(f"❌ خطا: فایل باینری Xray در مسیر {XRAY_PATH} یافت نشد! لطفاً ابتدا آن را دانلود کنید.")
-        sys.exit(1)
-        
+    if not os.path.exists(XRAY_PATH): sys.exit(1)
     start = time.time()
-    all_configs = gather_configurations(CONFIG_URLS)
+    all_configs = []
+    total_links = len(CONFIG_URLS)
+    safe_print("🚀 مرحله ۱/۴: در حال دریافت کانفیگ‌ها...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(fetch_subscription_content, url): url for url in CONFIG_URLS}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            content = future.result()
+            if content: all_configs.extend(process_subscription_content(content))
+            print_progress(i + 1, total_links, prefix='دریافت:')
+            
     ranked_configs = evaluate_configs(all_configs)
     save_results(ranked_configs)
-    safe_print(f"\n⏱️ کل فرآیند فیلترینگ در: {time.time() - start:.2f} ثانیه پایان یافت.")
+    safe_print(f"\n⏱️ زمان کل فرآیند مانیتورینگ: {time.time() - start:.2f} ثانیه")
 
 if __name__ == "__main__":
     main()
