@@ -245,7 +245,7 @@ def build_xray_config(config: Dict, local_port: int) -> Dict:
                 "network": "tcp",
                 "security": "reality",
                 "realitySettings": {
-                    "show": false,
+                    "show": False, # اصلاح شد: تغییر false به False
                     "fingerprint": config.get("fp", "chrome"),
                     "serverName": config.get("sni", ""),
                     "publicKey": config.get("pbk", ""),
