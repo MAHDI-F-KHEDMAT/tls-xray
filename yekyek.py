@@ -1,23 +1,29 @@
+# -- coding: utf-8 --
+
+import requests
+import os
+import re
+import base64
+import threading
 import concurrent.futures
 import socket
 import time
-import re
-import requests
-import base64
-import random # اضافه شده برای تولید عدد تصادفی
+import random
+import statistics
+import sys
+import urllib.parse
+import json
+import subprocess
+from typing import List, Dict, Tuple, Optional, Set, Union
 
-# لیست کامل منابع ارسالی شما
-SOURCES = [
+# --- Global Constants & Variables ---
+
+PRINT_LOCK = threading.Lock()
+OUTPUT_DIR = "data"
+XRAY_PATH = "./xray" # فرض بر این است که فایل باینری xray در این مسیر است
+
+CONFIG_URLS: List[str] = [
     "https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/base64/mix",
-    "https://raw.githubusercontent.com/thirtysixpw/v2ray-reaper/refs/heads/main/protocol/vless",
-    "https://raw.githubusercontent.com/Sage-77/V2ray-configs/refs/heads/main/vless.txt",
-    "https://raw.githubusercontent.com/R3ZARAHIMI/tg-v2ray-configs-every2h/refs/heads/main/conf-week.txt",
-    "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/refs/heads/main/githubmirror/new/all_new.txt",
-    "https://raw.githubusercontent.com/shuaidaoya/FreeNodes/refs/heads/main/nodes/base64.txt",
-    "https://raw.githubusercontent.com/Flikify/Free-Node/refs/heads/main/v2ray.txt",
-    "https://raw.githubusercontent.com/mfuu/v2ray/refs/heads/master/v2ray",
-    "https://raw.githubusercontent.com/w154594742/free-v2ray-node/refs/heads/master/v2ray.txt",
-    "https://raw.githubusercontent.com/w154594742/freeNode/refs/heads/main/all.txt",
     "https://raw.githubusercontent.com/shaoyouvip/free/refs/heads/main/base64.txt",
     "https://raw.githubusercontent.com/telegeam/freenode/refs/heads/master/v2ray.txt",
     "https://raw.githubusercontent.com/DukeMehdi/FreeList-V2ray-Configs/refs/heads/main/Configs/VLESS-V2Ray-Configs-By-DukeMehdi.txt",
@@ -57,117 +63,315 @@ SOURCES = [
     "https://media.githubusercontent.com/media/gfpcom/free-proxy-list/refs/heads/main/list/vless.txt"
 ]
 
-OUTPUT_FILE = "sorted_configs.txt"
-TIMEOUT = 1.5
-MAX_WORKERS = 250 # بهینه شده برای GitHub Actions
+OUTPUT_FILENAME: str = os.getenv("REALITY_OUTPUT_FILENAME", "khanevadeh") + "_base64.txt"
 
-def is_reality(link):
-    """فیلتر اختصاصی برای جدا کردن پروتکل Reality"""
-    return "security=reality" in link.lower()
+# تنظیمات تست
+REQUEST_TIMEOUT: int = 15
+TCP_CONNECT_TIMEOUT: int = 3
+NUM_TCP_TESTS: int = 3
+MIN_SUCCESSFUL_TESTS_RATIO: float = 0.6
 
-def smart_deduplicate(links):
-    """حذف تکراری‌ها بر اساس آدرس و UUID، نادیده گرفتن نام سرور"""
-    unique_configs = {}
-    for link in links:
-        # حذف نام سرور بعد از علامت #
-        tech_part = link.split('#')[0]
-        if tech_part not in unique_configs:
-            unique_configs[tech_part] = link
-    return list(unique_configs.values())
+# برای جلوگیری از تداخل زمان گیت‌هاب، سقف تست عمیق با Xray را محدود می‌کنیم
+MAX_CONFIGS_FOR_XRAY: int = 1500 
+FINAL_MAX_OUTPUT_CONFIGS: int = 500
 
-def fetch_and_decode(url):
-    """دانلود و رمزگشایی لینک‌ها از منابع"""
+SEEN_IDENTIFIERS: Set[Tuple[str, int, str]] = set()
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+]
+
+# --- Helper Functions ---
+
+def safe_print(message: str) -> None:
+    with PRINT_LOCK:
+        print(message)
+
+def print_progress(iteration: int, total: int, prefix: str = '', suffix: str = '', bar_length: int = 40) -> None:
+    with PRINT_LOCK:
+        if total == 0: total = 1
+        percent = ("{0:.1f}").format(100 * (iteration / float(total)))
+        filled_length = int(bar_length * iteration // total)
+        bar = '█' * filled_length + '-' * (bar_length - filled_length)
+        sys.stdout.write(f'\r{prefix} |{bar}| {percent}% {suffix}')
+        sys.stdout.flush()
+        if iteration >= total:
+            sys.stdout.write('\n')
+
+def get_free_port() -> int:
+    """یافتن یک پورت خالی در سیستم برای اختصاص دادن به پروسه Xray اکتیو"""
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+def parse_vless_config(config_str: str) -> Optional[Dict[str, Union[str, int]]]:
+    if not config_str.startswith("vless://"):
+        return None
     try:
-        response = requests.get(url, timeout=15)
-        if response.status_code == 200:
-            content = response.text.strip()
-            # اگر محتوا احتمالاً Base64 باشد (فاقد پروتکل مستقیم)
-            if "vless://" not in content[:50]:
-                try:
-                    content = base64.b64decode(content).decode('utf-8')
-                except: pass
+        parsed = urllib.parse.urlparse(config_str)
+        if not parsed.netloc or '@' not in parsed.netloc:
+            return None
             
-            raw_vless = re.findall(r"vless://[^\s]+", content)
-            # فیلتر کردن فقط Realityها در مرحله استخراج
-            return [l for l in raw_vless if is_reality(l)]
-    except: pass
-    return []
+        uuid, server_port = parsed.netloc.split('@', 1)
+        server_host = parsed.hostname
+        server_port_num = parsed.port
 
-def test_config(link):
-    """تست پینگ و پکت‌لاس در 4 مرحله"""
-    match = re.search(r"@([^:/?#]+):(\d+)", link)
-    if not match: return None
-    ip, port = match.group(1), int(match.group(2))
+        if not server_host or not server_port_num:
+            return None
 
-    latencies, lost = [], 0
-    for _ in range(4):
+        query_params = urllib.parse.parse_qs(parsed.query)
+        if query_params.get('security', [''])[0] != 'reality':
+            return None
+        
+        if not query_params.get('pbk', [''])[0]:
+            return None
+
+        return {
+            "uuid": uuid,
+            "server": server_host,
+            "port": int(server_port_num),
+            "pbk": query_params.get('pbk', [''])[0],
+            "fp": query_params.get('fp', [''])[0],
+            "sni": query_params.get('sni', [''])[0],
+            "sid": query_params.get('sid', [''])[0],
+            "spx": query_params.get('spx', [''])[0],
+            "name": urllib.parse.unquote(parsed.fragment) if parsed.fragment else "",
+            "original_config": config_str
+        }
+    except Exception:
+        return None
+
+def is_base64_content(s: str) -> bool:
+    if not isinstance(s, str) or not s:
+        return False
+    if not re.match(r'^[A-Za-z0-9+/=\s]+$', s) or len(s.strip()) % 4 != 0:
+        return False
+    try:
+        base64.b64decode(s, validate=True)
+        return True
+    except Exception:
+        return False
+
+# --- Core Logic ---
+
+def fetch_subscription_content(url: str) -> Optional[str]:
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT, headers={'User-Agent': USER_AGENTS[0]})
+        response.raise_for_status()
+        return response.text.strip()
+    except requests.RequestException:
+        return None
+
+def process_subscription_content(content: str, source_url: str) -> List[Dict[str, Union[str, int]]]:
+    if not content: return []
+    decoded_content = content
+    if is_base64_content(content):
         try:
-            start = time.perf_counter()
-            with socket.create_connection((ip, port), timeout=TIMEOUT) as sock:
-                latencies.append((time.perf_counter() - start) * 1000)
-        except:
-            lost += 1
-        time.sleep(0.01)
+            decoded_content = base64.b64decode(content).decode('utf-8', errors='ignore')
+        except Exception:
+            return []
+            
+    valid_configs = []
+    for line in decoded_content.splitlines():
+        line = line.strip()
+        if line.startswith("vless://") and "security=reality" in line:
+            parsed_data = parse_vless_config(line)
+            if parsed_data:
+                identifier = (parsed_data["server"], parsed_data["port"], parsed_data["uuid"])
+                if identifier not in SEEN_IDENTIFIERS:
+                    SEEN_IDENTIFIERS.add(identifier)
+                    valid_configs.append(parsed_data)
+    return valid_configs
 
-    loss_pct = (lost / 4) * 100
-    if loss_pct == 100: return None # حذف سرورهای کاملاً خاموش
+def gather_configurations(links: List[str]) -> List[Dict]:
+    safe_print("🚀 مرحله ۱/۳: در حال دریافت و پردازش اولیه کانفیگ‌ها...")
+    all_configs = []
+    total_links = len(links)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(fetch_subscription_content, url): url for url in links}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            content = future.result()
+            if content:
+                all_configs.extend(process_subscription_content(content, futures[future]))
+            print_progress(i + 1, total_links, prefix='دریافت:', suffix='تکمیل')
+    return all_configs
 
-    avg_ping = sum(latencies) / len(latencies) if latencies else 9999
-    # امتیاز: اولویت با پایداری (پکت‌لاس صفر) و سپس سرعت (پینگ کمتر)
-    score = avg_ping + (loss_pct * 1000)
-    return {"link": link, "score": score}
+def test_tcp_latency(host: str, port: int, timeout: int) -> Optional[float]:
+    try:
+        start_time = time.perf_counter()
+        with socket.create_connection((host, port), timeout=timeout):
+            return (time.perf_counter() - start_time) * 1000
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return None
+
+def quick_tcp_filter(config: Dict) -> Optional[Dict]:
+    """فیلتر اولیه برای حذف سرورهایی که پورتشان کاملاً بسته است"""
+    host, port = config['server'], config['port']
+    latencies = []
+    for _ in range(NUM_TCP_TESTS):
+        lat = test_tcp_latency(host, port, TCP_CONNECT_TIMEOUT)
+        if lat: latencies.append(lat)
+        time.sleep(0.02)
+        
+    if not latencies or len(latencies) < (NUM_TCP_TESTS * MIN_SUCCESSFUL_TESTS_RATIO):
+        return None
+        
+    config['tcp_latency'] = statistics.mean(latencies)
+    return config
+
+def build_xray_config(config: Dict, local_port: int) -> Dict:
+    """ساخت آبجکت جیسون استاندارد برای هسته Xray"""
+    return {
+        "log": {"loglevel": "none"},
+        "inbounds": [{
+            "port": local_port,
+            "listen": "127.0.0.1",
+            "protocol": "http"
+        }],
+        "outbounds": [{
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": config["server"],
+                    "port": config["port"],
+                    "users": [{
+                        "id": config["uuid"],
+                        "encryption": "none"
+                    }]
+                }]
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "fingerprint": config.get("fp", "chrome"),
+                    "serverName": config.get("sni", ""),
+                    "publicKey": config.get("pbk", ""),
+                    "shortId": config.get("sid", ""),
+                    "spiderX": config.get("spx", "")
+                }
+            }
+        }]
+    }
+
+def validate_with_xray(config: Dict) -> Optional[Dict]:
+    """تست واقعی و عمیق کانفیگ با اجرای لایو هسته Xray و ارسال ریکوئست HTTP"""
+    local_port = get_free_port()
+    thread_id = threading.get_ident()
+    config_file_path = f"temp_cfg_{thread_id}_{local_port}.json"
+    
+    # ایجاد فایل کانفیگ موقت برای این ترد
+    xray_json = build_xray_config(config, local_port)
+    with open(config_file_path, 'w') as f:
+        json.dump(xray_json, f)
+        
+    proc = None
+    try:
+        # اجرای باینری Xray در پس‌زمینه
+        proc = subprocess.Popen(
+            [XRAY_PATH, "-c", config_file_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        time.sleep(0.25) # زمان کوتاه برای لود شدن کامل کور در مموری
+        
+        # تنظیم پراکسی HTTP محلی جهت تست ریکوئست
+        proxies = {
+            "http": f"http://127.0.0.1:{local_port}",
+            "https://": f"http://127.0.0.1:{local_port}"
+        }
+        
+        # تست کانکشن واقعی به اینترنت آزاد از درون پراکسی
+        start_time = time.perf_counter()
+        response = requests.get(
+            "http://cp.cloudflare.com/generate_204",
+            proxies=proxies,
+            timeout=4
+        )
+        
+        if response.status_code == 204:
+            config['real_latency'] = (time.perf_counter() - start_time) * 1000
+            return config
+            
+    except Exception:
+        pass
+    finally:
+        # پاکسازی پروسه و فایل‌های موقت تحت هر شرایطی
+        if proc:
+            proc.terminate()
+            proc.wait()
+        if os.path.exists(config_file_path):
+            os.remove(config_file_path)
+            
+    return None
+
+def evaluate_configs(configs: List[Dict]) -> List[Dict]:
+    # مرحله ۲: فیلتر سریع TCP برای سبک کردن لیست
+    safe_print(f"\n🔍 مرحله ۲/۳: پورت اسکن سریع روی {len(configs)} کانفیگ ورودی...")
+    tcp_alive_configs = []
+    total_configs = len(configs)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
+        futures = {executor.submit(quick_tcp_filter, cfg): cfg for cfg in configs}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            res = future.result()
+            if res: tcp_alive_configs.append(res)
+            if (i + 1) % 50 == 0 or (i + 1) == total_configs:
+                print_progress(i + 1, total_configs, prefix='اسکن شبکه:', suffix='')
+
+    # مرتب‌سازی بر اساس پورت اسکن و انتخاب بهترین‌ها برای تست عمیق Xray
+    tcp_alive_configs.sort(key=lambda x: x['tcp_latency'])
+    target_for_xray = tcp_alive_configs[:MAX_CONFIGS_FOR_XRAY]
+    
+    # مرحله ۳: تست عمیق با خود هسته Xray
+    safe_print(f"\n🛡️ مرحله ۳/۳: تست کیفیت و صحت اعتبارسنجی با Xray-core روی {len(target_for_xray)} سرور زنده...")
+    final_verified_configs = []
+    total_xray = len(target_for_xray)
+    
+    # محدود کردن تعداد کارگرها به خاطر مصرف CPU هسته Xray در محیط اکشنز گیت‌هاب
+    xray_workers = min(12, os.cpu_count() * 3) 
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=xray_workers) as executor:
+        futures = {executor.submit(validate_with_xray, cfg): cfg for cfg in target_for_xray}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            res = future.result()
+            if res: final_verified_configs.append(res)
+            if (i + 1) % 10 == 0 or (i + 1) == total_xray:
+                print_progress(i + 1, total_xray, prefix='تست عمیق Xray:', suffix='')
+
+    # مرتب‌سازی نهایی بر اساس پینگ واقعی پروتکل حاصل از ریکوئست وب
+    final_verified_configs.sort(key=lambda x: x['real_latency'])
+    return final_verified_configs
+
+def save_results(configs: List[Dict]) -> None:
+    if not configs: 
+        safe_print("\n❌ هیچ کانفیگ سالمی در تست نهایی تایید نشد.")
+        return
+    top_configs = configs[:FINAL_MAX_OUTPUT_CONFIGS]
+    output_lines = []
+    for i, cfg in enumerate(top_configs, 1):
+        clean_link = cfg['original_config'].split('#')[0]
+        output_lines.append(f"{clean_link}#⚡_Config_{i}_RealPing-{int(cfg['real_latency'])}")
+        
+    base64_str = base64.b64encode("\n".join(output_lines).encode('utf-8')).decode('utf-8')
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(base64_str)
+    safe_print(f"\n💾 فایل نهایی با موفقیت ذخیره شد: {path} | تعداد کانفیگ‌های کاملاً تضمینی: {len(top_configs)}")
 
 def main():
-    start_all = time.time()
-    print("🚀 [1/4] Harvesting Reality configs from sources...")
-    
-    all_raw_reality = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=25) as loader:
-        results = list(loader.map(fetch_and_decode, SOURCES))
-        for r in results: all_raw_reality.extend(r)
-    
-    print(f"📦 Total Reality links found: {len(all_raw_reality)}")
-
-    print("🔍 [2/4] Executing Smart Deduplication...")
-    unique_links = smart_deduplicate(all_raw_reality)
-    print(f"💎 Unique configs to test: {len(unique_links)} (Removed {len(all_raw_reality)-len(unique_links)} duplicates)")
-
-    print(f"⚡ [3/4] Testing {len(unique_links)} configs with {MAX_WORKERS} workers...")
-    
-    final_list = []
-    tested = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as tester:
-        futures = {tester.submit(test_config, l): l for l in unique_links}
-        for f in concurrent.futures.as_completed(futures):
-            tested += 1
-            res = f.result()
-            if res: final_list.append(res)
-            
-            # چاپ گزارش زنده هر 100 تست
-            if tested % 100 == 0 or tested == len(unique_links):
-                print(f"⏱️ Progress: {tested}/{len(unique_links)} | Found {len(final_list)} alive")
-
-    print("📊 [4/4] Ranking and Saving results...")
-    # مرتب‌سازی بر اساس امتیاز (کمترین امتیاز بهترین است)
-    sorted_configs = sorted(final_list, key=lambda x: x['score'])
-
-    with open(OUTPUT_FILE, "w") as f:
-        used_numbers = set() # برای اطمینان از منحصر به فرد بودن اعداد
-        for item in sorted_configs:
-            # تولید عدد ۵ رقمی غیر تکراری
-            while True:
-                random_id = random.randint(10000, 99999)
-                if random_id not in used_numbers:
-                    used_numbers.add(random_id)
-                    break
-            
-            # جدا کردن بخش فنی لینک و چسباندن عدد تصادفی به عنوان نام
-            clean_link = item['link'].split('#')[0]
-            f.write(f"{clean_link}#{random_id}\n")
-
-    end_all = time.time()
-    print(f"✅ [FINISHED] Process completed in {round(end_all - start_all, 2)} seconds.")
-    print(f"🏆 Best configs are at the top of '{OUTPUT_FILE}'. Total healthy: {len(final_list)}")
+    if not os.path.exists(XRAY_PATH):
+        safe_print(f"❌ خطا: فایل باینری Xray در مسیر {XRAY_PATH} یافت نشد! لطفاً ابتدا آن را دانلود کنید.")
+        sys.exit(1)
+        
+    start = time.time()
+    all_configs = gather_configurations(CONFIG_URLS)
+    ranked_configs = evaluate_configs(all_configs)
+    save_results(ranked_configs)
+    safe_print(f"\n⏱️ کل فرآیند فیلترینگ در: {time.time() - start:.2f} ثانیه پایان یافت.")
 
 if __name__ == "__main__":
     main()
