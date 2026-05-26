@@ -8,13 +8,12 @@ import threading
 import concurrent.futures
 import socket
 import time
-import random
 import statistics
 import sys
 import urllib.parse
 import json
 import subprocess
-from typing import List, Dict, Tuple, Optional, Set, Union
+from typing import List, Dict, Tuple, Optional, Set
 
 # --- Global Constants & Variables ---
 
@@ -72,8 +71,7 @@ NUM_TCP_TESTS: int = 3
 MIN_SUCCESSFUL_TESTS_RATIO: float = 0.6
 
 # مدیریت محدودیت‌ها در GitHub Actions
-MAX_CONFIGS_FOR_XRAY: int = 1500 
-MAX_CONFIGS_FOR_IRAN_CHECK: int = 500  # طبق درخواست شما به ۵۰۰ افزایش یافت
+MAX_CONFIGS_FOR_XRAY: int = 5000  # تغییر به ۵۰۰۰ طبق درخواست شما
 FINAL_MAX_OUTPUT_CONFIGS: int = 20
 
 SEEN_IDENTIFIERS: Set[Tuple[str, int, str]] = set()
@@ -213,44 +211,9 @@ def validate_with_xray(config: Dict) -> Optional[Dict]:
         if os.path.exists(config_file_path): os.remove(config_file_path)
     return None
 
-def is_accessible_in_iran(config: Dict) -> Optional[Dict]:
-    try:
-        host, port = config['server'], config['port']
-        url = f"https://check-host.net/check-tcp?host={host}:{port}&node=ir1.node.check-host.net&node=ir4.node.check-host.net"
-        res = requests.get(url, headers={'Accept': 'application/json'}, timeout=8)
-        
-        if res.status_code in [403, 429]:
-            return config 
-            
-        if res.status_code != 200: return None
-        request_id = res.json().get("request_id")
-        if not request_id: return None
-        
-        for _ in range(5):
-            time.sleep(2.5)
-            result_res = requests.get(f"https://check-host.net/check-result/{request_id}", timeout=8)
-            if result_res.status_code != 200: continue
-            
-            results = result_res.json()
-            if not results: continue
-            
-            has_iran_node = False
-            for node, node_data in results.items():
-                if "ir" in node and node_data is not None:
-                    has_iran_node = True
-                    if isinstance(node_data, list) and len(node_data) > 0 and node_data[0]:
-                        if "time" in node_data[0] or "connected" in str(node_data[0]).lower():
-                            return config
-            
-            if has_iran_node: 
-                return None
-                
-    except Exception: pass
-    return None
-
 def evaluate_configs(configs: List[Dict]) -> List[Dict]:
     # مرحله ۲: پورت اسکن سریع
-    safe_print(f"\n🔍 مرحله ۲/۴: پورت اسکن سریع روی {len(configs)} کانفیگ ورودی...")
+    safe_print(f"\n🔍 مرحله ۲/۳: پورت اسکن سریع روی {len(configs)} کانفیگ ورودی...")
     tcp_alive = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
         futures = {executor.submit(quick_tcp_filter, cfg): cfg for cfg in configs}
@@ -263,7 +226,7 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
     target_for_xray = tcp_alive[:MAX_CONFIGS_FOR_XRAY]
     
     # مرحله ۳: تست فنی با هسته Xray
-    safe_print(f"\n🛡️ مرحله ۳/۴: تست صحت اعتبارسنجی با Xray-core روی {len(target_for_xray)} سرور زنده...")
+    safe_print(f"\n🛡️ مرحله ۳/۳: تست صحت اعتبارسنجی با Xray-core روی {len(target_for_xray)} سرور زنده...")
     xray_verified = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, os.cpu_count() * 3)) as executor:
         futures = {executor.submit(validate_with_xray, cfg): cfg for cfg in target_for_xray}
@@ -273,33 +236,18 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
             if (i + 1) % 10 == 0 or (i + 1) == len(target_for_xray): print_progress(i + 1, len(target_for_xray), prefix='تست عمیق Xray:')
 
     xray_verified.sort(key=lambda x: x['real_latency'])
-    target_for_iran = xray_verified[:MAX_CONFIGS_FOR_IRAN_CHECK] # حالا تا سقف ۵۰۰ کانفیگ را استخراج میکند
     
-    # مرحله ۴: تست فیلترینگ نهایی در ایران
-    safe_print(f"\n🇮🇷 مرحله ۴/۴: بررسی وضعیت فیلترینگ در ایران (Check-Host) روی {len(target_for_iran)} کانفیگ برتر...")
-    final_clean_configs = []
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {executor.submit(is_accessible_in_iran, cfg): cfg for cfg in target_for_iran}
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            res = future.result()
-            if res: final_clean_configs.append(res)
-            print_progress(i + 1, len(target_for_iran), prefix='تست فیلترینگ ایران:')
-            time.sleep(1.2)
-            
-    # سیستم زاپاس (Fallback) طبق دستور شما کاملاً حذف گردید.
-            
-    return final_clean_configs
+    return xray_verified
 
 def save_results(configs: List[Dict]) -> None:
     if not configs: 
-        safe_print("\n❌ هیچ کانفیگی که در ایران فیلتر نباشد پیدا نشد.")
+        safe_print("\n❌ هیچ کانفیگ سالمی پیدا نشد.")
         return
     top_configs = configs[:FINAL_MAX_OUTPUT_CONFIGS]
     output_lines = []
     for i, cfg in enumerate(top_configs, 1):
         clean_link = cfg['original_config'].split('#')[0]
-        output_lines.append(f"{clean_link}#🇮🇷_Verified_{i}_Ping-{int(cfg.get('real_latency', 0))}")
+        output_lines.append(f"{clean_link}#Verified_{i}_Ping-{int(cfg.get('real_latency', 0))}")
         
     base64_str = base64.b64encode("\n".join(output_lines).encode('utf-8')).decode('utf-8')
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -308,11 +256,14 @@ def save_results(configs: List[Dict]) -> None:
     safe_print(f"\n💾 فایل خروجی با موفقیت ثبت شد: {path} | تعداد کانفیگ‌ها: {len(top_configs)}")
 
 def main():
-    if not os.path.exists(XRAY_PATH): sys.exit(1)
+    if not os.path.exists(XRAY_PATH): 
+        safe_print("❌ هسته Xray یافت نشد. لطفاً فایل xray را در کنار اسکریپت قرار دهید.")
+        sys.exit(1)
+        
     start = time.time()
     all_configs = []
     total_links = len(CONFIG_URLS)
-    safe_print("🚀 مرحله ۱/۴: در حال دریافت دیتای اولیه سابسکریپشن‌ها...")
+    safe_print("🚀 مرحله ۱/۳: در حال دریافت دیتای اولیه سابسکریپشن‌ها...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
         futures = {executor.submit(fetch_subscription_content, url): url for url in CONFIG_URLS}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
