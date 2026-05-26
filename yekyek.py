@@ -71,7 +71,7 @@ NUM_TCP_TESTS: int = 3
 MIN_SUCCESSFUL_TESTS_RATIO: float = 0.6
 
 # مدیریت محدودیت‌ها در GitHub Actions
-MAX_CONFIGS_FOR_XRAY: int = 5000  # تغییر به ۵۰۰۰ طبق درخواست شما
+MAX_CONFIGS_FOR_XRAY: int = 100000  # تغییر به ۱۰۰,۰۰۰ طبق درخواست شما
 FINAL_MAX_OUTPUT_CONFIGS: int = 20
 
 SEEN_IDENTIFIERS: Set[Tuple[str, int, str]] = set()
