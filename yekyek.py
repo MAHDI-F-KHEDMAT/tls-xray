@@ -69,12 +69,12 @@ OUTPUT_FILENAME: str = os.getenv("MIXED_OUTPUT_FILENAME", "khanevadeh_mixed") + 
 
 # تنظیمات زمانی بهینه‌شده برای شبکه فوق‌سریع دیتاسنتر گیتهاب
 REQUEST_TIMEOUT: int = 10
-TCP_CONNECT_TIMEOUT: int = 3      # کاهش به ۳ ثانیه (سرعت بالاتر در پورت اسکن)
+TCP_CONNECT_TIMEOUT: int = 3      
 NUM_TCP_TESTS: int = 2            
 MIN_SUCCESSFUL_TESTS_RATIO: float = 0.5  
 
-# مدیریت محدودیت‌ها (بهینه‌سازی بسیار کلیدی برای سرعت)
-MAX_CONFIGS_FOR_XRAY: int = 3000   # فقط ۳۰۰۰ تا از بهترین‌های پورت‌اسکن وارد تست عمیق می‌شوند
+# مدیریت محدودیت‌ها (به درخواست شما روی ۳۰,۰۰۰ تنظیم شد)
+MAX_CONFIGS_FOR_XRAY: int = 30000   
 FINAL_MAX_OUTPUT_CONFIGS: int = 500  
 
 SEEN_IDENTIFIERS: Set[Tuple[str, str, int, str]] = set()
@@ -379,10 +379,10 @@ def validate_with_xray(config: Dict) -> Optional[Dict]:
     proc = None  
     try:  
         proc = subprocess.Popen([XRAY_PATH, "-c", config_file_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  
-        time.sleep(0.3)  # کاهش چشمگیر زمان انتظار لود شدن برای سرعت بالاتر در گیت‌هاب
+        time.sleep(0.3)  
         proxies = {"http": f"http://127.0.0.1:{local_port}", "https": f"http://127.0.0.1:{local_port}"}  
         start = time.perf_counter()  
-        response = requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=4.0) # کاهش تایم‌اوت کلودفلر
+        response = requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=4.0) 
         if response.status_code == 204:  
             config['real_latency'] = (time.perf_counter() - start) * 1000  
             return config  
@@ -400,7 +400,7 @@ def validate_with_xray(config: Dict) -> Optional[Dict]:
 def evaluate_configs(configs: List[Dict]) -> List[Dict]:
     safe_print(f"\n🔍 مرحله ۲/۳: پورت اسکن سریع روی {len(configs)} کانفیگ ورودی...")
     tcp_alive = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor: # افزایش توان اسکن موازی
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor: 
         futures = {executor.submit(quick_tcp_filter, cfg): cfg for cfg in configs}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             res = future.result()
@@ -413,7 +413,6 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
       
     safe_print(f"\n🛡️ مرحله ۳/۳: تست صحت اعتبارسنجی با Xray-core روی {len(target_for_xray)} سرور زنده...")  
     xray_verified = []  
-    # تخصیص مستقیم ۴۰ ترد موازی برای دور زدن محدودیت کلاک پردازنده در گیت‌هاب
     with concurrent.futures.ThreadPoolExecutor(max_workers=40) as executor:  
         futures = {executor.submit(validate_with_xray, cfg): cfg for cfg in target_for_xray}  
         for i, future in enumerate(concurrent.futures.as_completed(futures)):  
