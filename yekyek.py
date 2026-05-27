@@ -1,4 +1,4 @@
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 
 import requests
 import os
@@ -18,6 +18,9 @@ from typing import List, Dict, Tuple, Optional, Set
 # --- Global Constants & Variables ---
 
 PRINT_LOCK = threading.Lock()
+PORT_LOCK = threading.Lock()
+START_PORT = 30000  # اختصاص پورت ثابت پایه‌ای برای جلوگیری از تداخل
+
 OUTPUT_DIR = "data"
 XRAY_PATH = "./xray" 
 
@@ -71,7 +74,7 @@ NUM_TCP_TESTS: int = 3
 MIN_SUCCESSFUL_TESTS_RATIO: float = 0.6
 
 # مدیریت محدودیت‌ها در GitHub Actions
-MAX_CONFIGS_FOR_XRAY: int = 100000  # تغییر به ۱۰۰,۰۰۰ طبق درخواست شما
+MAX_CONFIGS_FOR_XRAY: int = 100000  
 FINAL_MAX_OUTPUT_CONFIGS: int = 20
 
 SEEN_IDENTIFIERS: Set[Tuple[str, int, str]] = set()
@@ -95,21 +98,30 @@ def print_progress(iteration: int, total: int, prefix: str = '', suffix: str = '
             sys.stdout.write('\n')
 
 def get_free_port() -> int:
-    s = socket.socket()
-    s.bind(('127.0.0.1', 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    """استفاده از سیستم قفل و کانتر برای جلوگیری از Race Condition در تخصیص پورت"""
+    global START_PORT
+    with PORT_LOCK:
+        port = START_PORT
+        START_PORT += 1
+        return port
 
 def parse_vless_config(config_str: str) -> Optional[Dict]:
     if not config_str.startswith("vless://"): return None
     try:
         parsed = urllib.parse.urlparse(config_str)
+        if '@' not in parsed.netloc: return None  # جلوگیری از خطا در صورت نامعتبر بودن لینک
+        
         uuid, server_port = parsed.netloc.split('@', 1)
         query_params = urllib.parse.parse_qs(parsed.query)
         if query_params.get('security', [''])[0] != 'reality': return None
+        
+        try:
+            port = int(parsed.port)
+        except (ValueError, TypeError):
+            return None
+
         return {
-            "uuid": uuid, "server": parsed.hostname, "port": int(parsed.port),
+            "uuid": uuid, "server": parsed.hostname, "port": port,
             "pbk": query_params.get('pbk', [''])[0], "fp": query_params.get('fp', [''])[0],
             "sni": query_params.get('sni', [''])[0], "sid": query_params.get('sid', [''])[0],
             "spx": query_params.get('spx', [''])[0],
@@ -120,9 +132,12 @@ def parse_vless_config(config_str: str) -> Optional[Dict]:
 
 def is_base64_content(s: str) -> bool:
     if not isinstance(s, str) or not s: return False
-    if not re.match(r'^[A-Za-z0-9+/=\s]+$', s) or len(s.strip()) % 4 != 0: return False
+    s = s.strip()
+    if not re.match(r'^[A-Za-z0-9+/=\s]+$', s): return False
     try:
-        base64.b64decode(s, validate=True)
+        # اضافه کردن پدینگ به صورت خودکار
+        padded = s + "=" * ((4 - len(s) % 4) % 4)
+        base64.b64decode(padded, validate=False)
         return True
     except Exception: return False
 
@@ -138,7 +153,9 @@ def process_subscription_content(content: str) -> List[Dict]:
     if not content: return []
     decoded = content
     if is_base64_content(content):
-        try: decoded = base64.b64decode(content).decode('utf-8', errors='ignore')
+        try: 
+            padded = content.strip() + "=" * ((4 - len(content.strip()) % 4) % 4)
+            decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
         except Exception: return []
             
     valid_configs = []
@@ -196,8 +213,9 @@ def validate_with_xray(config: Dict) -> Optional[Dict]:
     proc = None
     try:
         proc = subprocess.Popen([XRAY_PATH, "-c", config_file_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.2)
-        proxies = {"http": f"http://127.0.0.1:{local_port}", "https://": f"http://127.0.0.1:{local_port}"}
+        time.sleep(0.5)  # زمان بیشتر برای استارت آپ شدن هسته Xray
+        # اصلاح کلیدهای دیکشنری پروکسی
+        proxies = {"http": f"http://127.0.0.1:{local_port}", "https": f"http://127.0.0.1:{local_port}"}
         start = time.perf_counter()
         response = requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=3.5)
         if response.status_code == 204:
@@ -208,11 +226,12 @@ def validate_with_xray(config: Dict) -> Optional[Dict]:
         if proc:
             proc.terminate()
             proc.wait()
-        if os.path.exists(config_file_path): os.remove(config_file_path)
+        if os.path.exists(config_file_path): 
+            try: os.remove(config_file_path)
+            except OSError: pass
     return None
 
 def evaluate_configs(configs: List[Dict]) -> List[Dict]:
-    # مرحله ۲: پورت اسکن سریع
     safe_print(f"\n🔍 مرحله ۲/۳: پورت اسکن سریع روی {len(configs)} کانفیگ ورودی...")
     tcp_alive = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
@@ -225,7 +244,6 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
     tcp_alive.sort(key=lambda x: x['tcp_latency'])
     target_for_xray = tcp_alive[:MAX_CONFIGS_FOR_XRAY]
     
-    # مرحله ۳: تست فنی با هسته Xray
     safe_print(f"\n🛡️ مرحله ۳/۳: تست صحت اعتبارسنجی با Xray-core روی {len(target_for_xray)} سرور زنده...")
     xray_verified = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, os.cpu_count() * 3)) as executor:
