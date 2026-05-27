@@ -65,19 +65,19 @@ CONFIG_URLS: List[str] = [
     "https://raw.githubusercontent.com/gfpcom/free-proxy-list/refs/heads/main/list/vless.txt"
 ]
 
-OUTPUT_FILENAME: str = os.getenv("MIXED_OUTPUT_FILENAME", "khanevadeh_mixed") + "_base64.txt"
+OUTPUT_FILENAME: str = os.getenv("TLS_OUTPUT_FILENAME", "khanevadeh_tls") + "_base64.txt"
 
-# تنظیمات زمانی بهینه‌شده برای شبکه فوق‌سریع دیتاسنتر گیتهاب
-REQUEST_TIMEOUT: int = 10
-TCP_CONNECT_TIMEOUT: int = 3      
-NUM_TCP_TESTS: int = 2            
-MIN_SUCCESSFUL_TESTS_RATIO: float = 0.5  
+# تنظیمات زمانی تست‌ها (اصلاح شده برای کانفیگ‌های پابلیک)
+REQUEST_TIMEOUT: int = 15
+TCP_CONNECT_TIMEOUT: int = 5      # افزایش یافت تا کانفیگ‌های کندتر هم شانس داشته باشند
+NUM_TCP_TESTS: int = 2            # کاهش تعداد تست‌های TCP برای سرعت بخشیدن به اسکن
+MIN_SUCCESSFUL_TESTS_RATIO: float = 0.5  # معادل گرفتن جواب از حداقل ۱ تست از ۲ تست
 
-# مدیریت محدودیت‌ها (به درخواست شما روی ۳۰,۰۰۰ تنظیم شد)
-MAX_CONFIGS_FOR_XRAY: int = 30000   
+# مدیریت محدودیت‌ها
+MAX_CONFIGS_FOR_XRAY: int = 100000
 FINAL_MAX_OUTPUT_CONFIGS: int = 500  
 
-SEEN_IDENTIFIERS: Set[Tuple[str, str, int, str]] = set()
+SEEN_IDENTIFIERS: Set[Tuple[str, int, str]] = set()
 USER_AGENTS = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36']
 
 # --- Helper Functions ---
@@ -112,23 +112,24 @@ def parse_vless_config(config_str: str) -> Optional[Dict]:
 
         uuid, server_port = parsed.netloc.split('@', 1)  
         query_params = urllib.parse.parse_qs(parsed.query)  
-        
-        security = query_params.get('security', ['none'])[0].lower()
-        if security != 'none': return None  
+        if query_params.get('security', [''])[0] != 'tls': return None  
           
         try:  
             port = int(parsed.port)  
         except (ValueError, TypeError):  
             return None  
 
+        # تشخیص نوع ترانسپورت (ws, grpc, tcp, http)  
         network = query_params.get('type', query_params.get('net', ['tcp']))[0]  
 
         return {  
-            "protocol": "vless",
             "uuid": uuid,   
             "server": parsed.hostname,   
             "port": port,  
             "network": network,  
+            "fp": query_params.get('fp', [''])[0],  
+            "sni": query_params.get('sni', [''])[0],  
+            "alpn": query_params.get('alpn', [''])[0],  
             "path": query_params.get('path', [''])[0],  
             "host": query_params.get('host', [''])[0],  
             "serviceName": query_params.get('serviceName', [''])[0],  
@@ -136,76 +137,6 @@ def parse_vless_config(config_str: str) -> Optional[Dict]:
             "original_config": config_str  
         }  
     except Exception: 
-        return None
-
-def parse_vmess_config(config_str: str) -> Optional[Dict]:
-    if not config_str.startswith("vmess://"): return None
-    try:
-        b64_data = config_str[8:].split('#')[0].strip()
-        padded = b64_data + "=" * ((4 - len(b64_data) % 4) % 4)
-        json_str = base64.b64decode(padded).decode('utf-8', errors='ignore')
-        data = json.loads(json_str)
-        
-        return {
-            "protocol": "vmess",
-            "uuid": data.get("id"),
-            "server": data.get("add"),
-            "port": int(data.get("port")),
-            "network": data.get("net", "tcp"),
-            "security": data.get("tls", "none"),
-            "path": data.get("path", ""),
-            "host": data.get("host", ""),
-            "aid": int(data.get("aid", 0)),
-            "name": data.get("ps", ""),
-            "original_config": config_str
-        }
-    except Exception:
-        return None
-
-def parse_ss_config(config_str: str) -> Optional[Dict]:
-    if not config_str.startswith("ss://"): return None
-    try:
-        parsed = urllib.parse.urlparse(config_str)
-        netloc = parsed.netloc
-        
-        if '@' in netloc:
-            userinfo, server_port = netloc.split('@', 1)
-            try:
-                padded = userinfo + "=" * ((4 - len(userinfo) % 4) % 4)
-                decoded_userinfo = base64.b64decode(padded).decode('utf-8')
-                if ':' in decoded_userinfo:
-                    method, password = decoded_userinfo.split(':', 1)
-                else:
-                    if ':' in userinfo: method, password = userinfo.split(':', 1)
-                    else: return None
-            except Exception:
-                if ':' in userinfo: method, password = userinfo.split(':', 1)
-                else: return None
-        else:
-            b64_data = config_str[5:].split('#')[0].split('?')[0].strip()
-            padded = b64_data + "=" * ((4 - len(b64_data) % 4) % 4)
-            decoded = base64.b64decode(padded).decode('utf-8')
-            if '@' in decoded:
-                userinfo, server_port = decoded.split('@', 1)
-                if ':' in userinfo: method, password = userinfo.split(':', 1)
-                else: return None
-            else: return None
-
-        if ':' in server_port:
-            server, port_str = server_port.split(':', 1)
-            port = int(port_str)
-        else: return None
-
-        return {
-            "protocol": "shadowsocks",
-            "server": server,
-            "port": port,
-            "method": method,
-            "password": password,
-            "name": urllib.parse.unquote(parsed.fragment) if parsed.fragment else "",
-            "original_config": config_str
-        }
-    except Exception:
         return None
 
 def is_base64_content(s: str) -> bool:
@@ -240,21 +171,13 @@ def process_subscription_content(content: str) -> List[Dict]:
     valid_configs = []  
     for line in decoded.splitlines():  
         line = line.strip()  
-        parsed_data = None
-        
-        if line.startswith("vless://"):
-            parsed_data = parse_vless_config(line)
-        elif line.startswith("vmess://"):
-            parsed_data = parse_vmess_config(line)
-        elif line.startswith("ss://"):
-            parsed_data = parse_ss_config(line)
-            
-        if parsed_data:  
-            uniq_id = parsed_data.get("uuid") or parsed_data.get("password") or ""
-            identifier = (parsed_data["protocol"], parsed_data["server"], parsed_data["port"], uniq_id)  
-            if identifier not in SEEN_IDENTIFIERS:  
-                SEEN_IDENTIFIERS.add(identifier)  
-                valid_configs.append(parsed_data)  
+        if line.startswith("vless://") and "security=tls" in line:  
+            parsed_data = parse_vless_config(line)  
+            if parsed_data:  
+                identifier = (parsed_data["server"], parsed_data["port"], parsed_data["uuid"])  
+                if identifier not in SEEN_IDENTIFIERS:  
+                    SEEN_IDENTIFIERS.add(identifier)  
+                    valid_configs.append(parsed_data)  
     return valid_configs
 
 def test_tcp_latency(host: str, port: int, timeout: int) -> Optional[float]:
@@ -270,104 +193,51 @@ def quick_tcp_filter(config: Dict) -> Optional[Dict]:
     for _ in range(NUM_TCP_TESTS):
         lat = test_tcp_latency(config['server'], config['port'], TCP_CONNECT_TIMEOUT)
         if lat: latencies.append(lat)
-        time.sleep(0.005)
+        time.sleep(0.01)
     if not latencies or len(latencies) < (NUM_TCP_TESTS * MIN_SUCCESSFUL_TESTS_RATIO): 
         return None
     config['tcp_latency'] = statistics.mean(latencies)
     return config
 
 def build_xray_config(config: Dict, local_port: int) -> Dict:
-    protocol = config.get("protocol")
-    outbound = {}
-
-    if protocol == "vless":
-        stream_settings = {
-            "network": config.get("network", "tcp"),
-            "security": "none"
+    stream_settings = {
+        "network": config.get("network", "tcp"),
+        "security": "tls",
+        "tlsSettings": {
+            "serverName": config.get("sni", ""),
+            "fingerprint": config.get("fp", "chrome")
         }
-        net_type = config.get("network", "tcp")  
-        if net_type == "ws":  
-            stream_settings["wsSettings"] = {  
-                "path": config.get("path", ""),  
-                "headers": {"Host": config.get("host", "")} if config.get("host") else {}  
-            }  
-        elif net_type == "grpc":  
-            stream_settings["grpcSettings"] = {  
-                "serviceName": config.get("serviceName", "")  
-            }  
-        elif net_type in ["http", "h2"]:  
-            stream_settings["httpSettings"] = {  
-                "path": config.get("path", ""),  
-                "host": [config.get("host", "")] if config.get("host") else []  
-            }  
+    }
 
-        outbound = {  
-            "protocol": "vless",  
-            "settings": {"vnext": [{"address": config["server"], "port": config["port"], "users": [{"id": config["uuid"], "encryption": "none"}]}]},  
-            "streamSettings": stream_settings  
-        }
+    # اضافه کردن ALPN در صورت وجود  
+    if config.get("alpn"):  
+        stream_settings["tlsSettings"]["alpn"] = [a.strip() for a in config["alpn"].split(",") if a.strip()]  
 
-    elif protocol == "vmess":
-        is_tls = config.get("security") == "tls"
-        stream_settings = {
-            "network": config.get("network", "tcp"),
-            "security": "tls" if is_tls else "none"
-        }
-        if is_tls:
-            stream_settings["tlsSettings"] = {
-                "serverName": config.get("host") or config["server"],
-                "fingerprint": "chrome"
-            }
-        
-        net_type = config.get("network", "tcp")  
-        if net_type == "ws":  
-            stream_settings["wsSettings"] = {  
-                "path": config.get("path", ""),  
-                "headers": {"Host": config.get("host", "")} if config.get("host") else {}  
-            }  
-        elif net_type == "grpc":  
-            stream_settings["grpcSettings"] = {  
-                "serviceName": config.get("path", "")  
-            }  
-        elif net_type in ["http", "h2"]:  
-            stream_settings["httpSettings"] = {  
-                "path": config.get("path", ""),  
-                "host": [config.get("host", "")] if config.get("host") else []  
-            }  
-
-        outbound = {
-            "protocol": "vmess",
-            "settings": {
-                "vnext": [{
-                    "address": config["server"],
-                    "port": config["port"],
-                    "users": [{
-                        "id": config["uuid"],
-                        "alterId": config.get("aid", 0),
-                        "security": "auto"
-                    }]
-                }]
-            },
-            "streamSettings": stream_settings
-        }
-
-    elif protocol == "shadowsocks":
-        outbound = {
-            "protocol": "shadowsocks",
-            "settings": {
-                "servers": [{
-                    "address": config["server"],
-                    "port": config["port"],
-                    "method": config["method"],
-                    "password": config["password"]
-                }]
-            }
-        }
+    # تنظیمات اختصاصی شبکه (Transport Layers)  
+    net_type = config.get("network", "tcp")  
+    if net_type == "ws":  
+        stream_settings["wsSettings"] = {  
+            "path": config.get("path", ""),  
+            "headers": {"Host": config.get("host", "")} if config.get("host") else {}  
+        }  
+    elif net_type == "grpc":  
+        stream_settings["grpcSettings"] = {  
+            "serviceName": config.get("serviceName", "")  
+        }  
+    elif net_type in ["http", "h2"]:  
+        stream_settings["httpSettings"] = {  
+            "path": config.get("path", ""),  
+            "host": [config.get("host", "")] if config.get("host") else []  
+        }  
 
     return {  
         "log": {"loglevel": "none"},  
         "inbounds": [{"port": local_port, "listen": "127.0.0.1", "protocol": "http"}],  
-        "outbounds": [outbound]  
+        "outbounds": [{  
+            "protocol": "vless",  
+            "settings": {"vnext": [{"address": config["server"], "port": config["port"], "users": [{"id": config["uuid"], "encryption": "none"}]}]},  
+            "streamSettings": stream_settings  
+        }]  
     }
 
 def validate_with_xray(config: Dict) -> Optional[Dict]:
@@ -379,10 +249,11 @@ def validate_with_xray(config: Dict) -> Optional[Dict]:
     proc = None  
     try:  
         proc = subprocess.Popen([XRAY_PATH, "-c", config_file_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  
-        time.sleep(0.3)  
+        time.sleep(1.5)  # افزایش زمان مکث برای اطمینان از بالا آمدن کامل Xray روی سیستم
         proxies = {"http": f"http://127.0.0.1:{local_port}", "https": f"http://127.0.0.1:{local_port}"}  
         start = time.perf_counter()  
-        response = requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=4.0) 
+        # افزایش زمان تست Xray به ۱۰ ثانیه
+        response = requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=10.0)  
         if response.status_code == 204:  
             config['real_latency'] = (time.perf_counter() - start) * 1000  
             return config  
@@ -400,12 +271,12 @@ def validate_with_xray(config: Dict) -> Optional[Dict]:
 def evaluate_configs(configs: List[Dict]) -> List[Dict]:
     safe_print(f"\n🔍 مرحله ۲/۳: پورت اسکن سریع روی {len(configs)} کانفیگ ورودی...")
     tcp_alive = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor: 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
         futures = {executor.submit(quick_tcp_filter, cfg): cfg for cfg in configs}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             res = future.result()
             if res: tcp_alive.append(res)
-            if (i + 1) % 100 == 0 or (i + 1) == len(configs): 
+            if (i + 1) % 50 == 0 or (i + 1) == len(configs): 
                 print_progress(i + 1, len(configs), prefix='اسکن شبکه:')
 
     tcp_alive.sort(key=lambda x: x['tcp_latency'])  
@@ -413,15 +284,16 @@ def evaluate_configs(configs: List[Dict]) -> List[Dict]:
       
     safe_print(f"\n🛡️ مرحله ۳/۳: تست صحت اعتبارسنجی با Xray-core روی {len(target_for_xray)} سرور زنده...")  
     xray_verified = []  
-    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as executor:  
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, os.cpu_count() * 3)) as executor:  
         futures = {executor.submit(validate_with_xray, cfg): cfg for cfg in target_for_xray}  
         for i, future in enumerate(concurrent.futures.as_completed(futures)):  
             res = future.result()  
             if res: xray_verified.append(res)  
-            if (i + 1) % 20 == 0 or (i + 1) == len(target_for_xray): 
+            if (i + 1) % 10 == 0 or (i + 1) == len(target_for_xray): 
                 print_progress(i + 1, len(target_for_xray), prefix='تست عمیق Xray:')  
 
     xray_verified.sort(key=lambda x: x['real_latency'])  
+      
     return xray_verified
 
 def save_results(configs: List[Dict]) -> None:
@@ -432,7 +304,7 @@ def save_results(configs: List[Dict]) -> None:
     output_lines = []
     for i, cfg in enumerate(top_configs, 1):
         clean_link = cfg['original_config'].split('#')[0]
-        output_lines.append(f"{clean_link}#Verified_{cfg['protocol'].upper()}_{i}_Ping-{int(cfg.get('real_latency', 0))}")
+        output_lines.append(f"{clean_link}#Verified_{i}_Ping-{int(cfg.get('real_latency', 0))}")
 
     base64_str = base64.b64encode("\n".join(output_lines).encode('utf-8')).decode('utf-8')  
     os.makedirs(OUTPUT_DIR, exist_ok=True)  
@@ -449,7 +321,7 @@ def main():
     all_configs = []  
     total_links = len(CONFIG_URLS)  
     safe_print("🚀 مرحله ۱/۳: در حال دریافت دیتای اولیه سابسکریپشن‌ها...")  
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:  
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:  
         futures = {executor.submit(fetch_subscription_content, url): url for url in CONFIG_URLS}  
         for i, future in enumerate(concurrent.futures.as_completed(futures)):  
             content = future.result()  
