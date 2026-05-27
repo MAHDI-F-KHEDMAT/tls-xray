@@ -62,10 +62,10 @@ CONFIG_URLS: List[str] = [
     "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/refs/heads/main/githubmirror/14.txt",
     "https://raw.githubusercontent.com/Awmiroosen/awmirx-v2ray/refs/heads/main/blob/main/v2-sub.txt",
     "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/Protocols/vless.txt",
-    "https://media.githubusercontent.com/media/gfpcom/free-proxy-list/refs/heads/main/list/vless.txt"
+    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/refs/heads/main/list/vless.txt"
 ]
 
-OUTPUT_FILENAME: str = os.getenv("REALITY_OUTPUT_FILENAME", "khanevadeh") + "_base64.txt"
+OUTPUT_FILENAME: str = os.getenv("TLS_OUTPUT_FILENAME", "khanevadeh_tls") + "_base64.txt"
 
 # تنظیمات زمانی تست‌ها
 REQUEST_TIMEOUT: int = 15
@@ -98,7 +98,6 @@ def print_progress(iteration: int, total: int, prefix: str = '', suffix: str = '
             sys.stdout.write('\n')
 
 def get_free_port() -> int:
-    """استفاده از سیستم قفل و کانتر برای جلوگیری از Race Condition در تخصیص پورت"""
     global START_PORT
     with PORT_LOCK:
         port = START_PORT
@@ -109,22 +108,31 @@ def parse_vless_config(config_str: str) -> Optional[Dict]:
     if not config_str.startswith("vless://"): return None
     try:
         parsed = urllib.parse.urlparse(config_str)
-        if '@' not in parsed.netloc: return None  # جلوگیری از خطا در صورت نامعتبر بودن لینک
+        if '@' not in parsed.netloc: return None
         
         uuid, server_port = parsed.netloc.split('@', 1)
         query_params = urllib.parse.parse_qs(parsed.query)
-        if query_params.get('security', [''])[0] != 'reality': return None
+        if query_params.get('security', [''])[0] != 'tls': return None
         
         try:
             port = int(parsed.port)
         except (ValueError, TypeError):
             return None
 
+        # تشخیص نوع ترانسپورت (ws, grpc, tcp, http)
+        network = query_params.get('type', query_params.get('net', ['tcp']))[0]
+
         return {
-            "uuid": uuid, "server": parsed.hostname, "port": port,
-            "pbk": query_params.get('pbk', [''])[0], "fp": query_params.get('fp', [''])[0],
-            "sni": query_params.get('sni', [''])[0], "sid": query_params.get('sid', [''])[0],
-            "spx": query_params.get('spx', [''])[0],
+            "uuid": uuid, 
+            "server": parsed.hostname, 
+            "port": port,
+            "network": network,
+            "fp": query_params.get('fp', [''])[0],
+            "sni": query_params.get('sni', [''])[0],
+            "alpn": query_params.get('alpn', [''])[0],
+            "path": query_params.get('path', [''])[0],
+            "host": query_params.get('host', [''])[0],
+            "serviceName": query_params.get('serviceName', [''])[0],
             "name": urllib.parse.unquote(parsed.fragment) if parsed.fragment else "",
             "original_config": config_str
         }
@@ -135,7 +143,6 @@ def is_base64_content(s: str) -> bool:
     s = s.strip()
     if not re.match(r'^[A-Za-z0-9+/=\s]+$', s): return False
     try:
-        # اضافه کردن پدینگ به صورت خودکار
         padded = s + "=" * ((4 - len(s) % 4) % 4)
         base64.b64decode(padded, validate=False)
         return True
@@ -161,7 +168,7 @@ def process_subscription_content(content: str) -> List[Dict]:
     valid_configs = []
     for line in decoded.splitlines():
         line = line.strip()
-        if line.startswith("vless://") and "security=reality" in line:
+        if line.startswith("vless://") and "security=tls" in line:
             parsed_data = parse_vless_config(line)
             if parsed_data:
                 identifier = (parsed_data["server"], parsed_data["port"], parsed_data["uuid"])
@@ -188,20 +195,43 @@ def quick_tcp_filter(config: Dict) -> Optional[Dict]:
     return config
 
 def build_xray_config(config: Dict, local_port: int) -> Dict:
+    stream_settings = {
+        "network": config.get("network", "tcp"), 
+        "security": "tls",
+        "tlsSettings": {
+            "serverName": config.get("sni", ""),
+            "fingerprint": config.get("fp", "chrome")
+        }
+    }
+    
+    # اضافه کردن ALPN در صورت وجود
+    if config.get("alpn"):
+        stream_settings["tlsSettings"]["alpn"] = [a.strip() for a in config["alpn"].split(",") if a.strip()]
+
+    # تنظیمات اختصاصی شبکه (Transport Layers)
+    net_type = config.get("network", "tcp")
+    if net_type == "ws":
+        stream_settings["wsSettings"] = {
+            "path": config.get("path", ""),
+            "headers": {"Host": config.get("host", "")} if config.get("host") else {}
+        }
+    elif net_type == "grpc":
+        stream_settings["grpcSettings"] = {
+            "serviceName": config.get("serviceName", "")
+        }
+    elif net_type in ["http", "h2"]:
+        stream_settings["httpSettings"] = {
+            "path": config.get("path", ""),
+            "host": [config.get("host", "")] if config.get("host") else []
+        }
+
     return {
         "log": {"loglevel": "none"},
         "inbounds": [{"port": local_port, "listen": "127.0.0.1", "protocol": "http"}],
         "outbounds": [{
             "protocol": "vless",
             "settings": {"vnext": [{"address": config["server"], "port": config["port"], "users": [{"id": config["uuid"], "encryption": "none"}]}]},
-            "streamSettings": {
-                "network": "tcp", "security": "reality",
-                "realitySettings": {
-                    "show": False, 
-                    "fingerprint": config.get("fp", "chrome"), "serverName": config.get("sni", ""),
-                    "publicKey": config.get("pbk", ""), "shortId": config.get("sid", ""), "spiderX": config.get("spx", "")
-                }
-            }
+            "streamSettings": stream_settings
         }]
     }
 
@@ -213,8 +243,7 @@ def validate_with_xray(config: Dict) -> Optional[Dict]:
     proc = None
     try:
         proc = subprocess.Popen([XRAY_PATH, "-c", config_file_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)  # زمان بیشتر برای استارت آپ شدن هسته Xray
-        # اصلاح کلیدهای دیکشنری پروکسی
+        time.sleep(0.5) 
         proxies = {"http": f"http://127.0.0.1:{local_port}", "https": f"http://127.0.0.1:{local_port}"}
         start = time.perf_counter()
         response = requests.get("http://cp.cloudflare.com/generate_204", proxies=proxies, timeout=3.5)
