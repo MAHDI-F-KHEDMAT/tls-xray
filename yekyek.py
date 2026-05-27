@@ -73,9 +73,9 @@ TCP_CONNECT_TIMEOUT: int = 3
 NUM_TCP_TESTS: int = 3
 MIN_SUCCESSFUL_TESTS_RATIO: float = 0.6
 
-# مدیریت محدودیت‌ها در GitHub Actions
+# مدیریت محدودیت‌ها
 MAX_CONFIGS_FOR_XRAY: int = 100000  
-FINAL_MAX_OUTPUT_CONFIGS: int = 20
+FINAL_MAX_OUTPUT_CONFIGS: int = 500  # <--- به درخواست شما به ۵۰۰ تغییر یافت
 
 SEEN_IDENTIFIERS: Set[Tuple[str, int, str]] = set()
 USER_AGENTS = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36']
